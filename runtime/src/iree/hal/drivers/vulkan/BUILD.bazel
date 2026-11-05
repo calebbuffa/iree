@@ -28,6 +28,7 @@ iree_runtime_cc_library(
 iree_runtime_cc_library(
     name = "headers",
     hdrs = [
+        "allocator.h",
         "api.h",
         "command_buffer.h",
         "debug_utils.h",
@@ -40,10 +41,27 @@ iree_runtime_cc_library(
     ],
     deps = [
         ":api",
+        "//runtime/src/iree/async",
         "//runtime/src/iree/base",
         "//runtime/src/iree/hal",
         "//runtime/src/iree/hal/drivers/vulkan/util:libvulkan",
         "@vulkan_headers",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "allocator_test",
+    srcs = ["allocator_test.cc"],
+    group = "iree-hal-drivers-vulkan-tests",
+    deps = [
+        ":headers",
+        ":vulkan",
+        "//runtime/src/iree/async:platform",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/hal/memory:slab_provider",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
     ],
 )
 

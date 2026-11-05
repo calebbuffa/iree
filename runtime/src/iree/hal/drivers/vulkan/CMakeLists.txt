@@ -25,6 +25,7 @@ iree_cc_library(
   NAME
     headers
   HDRS
+    "allocator.h"
     "api.h"
     "command_buffer.h"
     "debug_utils.h"
@@ -37,10 +38,29 @@ iree_cc_library(
   DEPS
     ::api
     Vulkan::Headers
+    iree::async
     iree::base
     iree::hal
     iree::hal::drivers::vulkan::util::libvulkan
   PUBLIC
+)
+
+iree_cc_test(
+  NAME
+    allocator_test
+  SRCS
+    "allocator_test.cc"
+  DEPS
+    ::headers
+    ::vulkan
+    iree::async::platform
+    iree::base
+    iree::hal
+    iree::hal::memory::slab_provider
+    iree::testing::gtest
+    iree::testing::gtest_main
+  GROUP
+    "iree-hal-drivers-vulkan-tests"
 )
 
 iree_cc_test(

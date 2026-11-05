@@ -424,6 +424,11 @@ static int32_t iree_hal_vulkan_allocator_memory_type_priority(
   int32_t priority = 0;
   if (iree_all_bits_set(memory_type, IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL)) {
     priority += 100;
+    // Keep the default device pool off small host-visible BAR heaps when
+    // private device memory is available.
+    if (!iree_all_bits_set(memory_type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
+      priority += 20;
+    }
   }
   if (iree_all_bits_set(memory_type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
     priority += 10;
@@ -865,6 +870,10 @@ static int iree_hal_vulkan_allocator_score_memory_type(
   int score = 0;
   if (iree_all_bits_set(memory_type, IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL)) {
     score += dispatch_requested && !mapping_requested ? 100 : 20;
+    if (!mapping_requested &&
+        !iree_all_bits_set(memory_type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
+      score += 20;
+    }
   }
   if (iree_all_bits_set(memory_type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
     score += mapping_requested ? 80 : 5;
