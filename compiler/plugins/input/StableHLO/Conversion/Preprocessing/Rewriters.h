@@ -21,6 +21,12 @@ void populateCanonicalizationPatterns(MLIRContext *context,
                                       RewritePatternSet *patterns,
                                       PatternBenefit benefit = 1);
 
+/// Collection of canonicalization patterns for StableHLO without
+/// ReorderElementwiseAndShapeOp, which is not dialect-conversion safe.
+void populateCanonicalizationPatternsNoReorder(MLIRContext *context,
+                                             RewritePatternSet *patterns,
+                                             PatternBenefit benefit = 1);
+
 /// Collection of rewrite patterns for lowering of StableHLO dot general
 /// operations.
 void populatePreprocessingDotGeneralToDotPatterns(MLIRContext *context,
