@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/GPU/Utils/DistributionUtils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -30,6 +31,110 @@ namespace mlir::iree_compiler {
 #include "iree/compiler/Codegen/Common/GPU/Passes.h.inc"
 
 namespace {
+// MLIR distributes a loop only at the end of a warp region. Independent
+// read-only epilogue code must not strand an otherwise distributable loop.
+struct WarpOpReadOnlyLoop final : gpu::WarpDistributionPattern {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(gpu::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override {
+    OpOperand *yieldOperand = getWarpResult(
+        warpOp, [](Operation *op) { return isa<scf::ForOp>(op); });
+    if (!yieldOperand) {
+      return failure();
+    }
+    Operation *loop = yieldOperand->get().getDefiningOp();
+    Operation *terminator = warpOp.getTerminator();
+    if (loop->getNextNode() == terminator ||
+        !llvm::all_of(loop->getUsers(),
+                      [&](Operation *user) { return user == terminator; })) {
+      return failure();
+    }
+    auto readOnly = [](Operation *op) {
+      auto effects = getEffectsRecursively(op);
+      return effects && llvm::all_of(*effects, [](auto effect) {
+               return isa<MemoryEffects::Read>(effect.getEffect());
+             });
+    };
+    if (!readOnly(loop)) {
+      return failure();
+    }
+    for (Operation *op = loop->getNextNode(); op != terminator;
+         op = op->getNextNode()) {
+      if (!readOnly(op)) {
+        return failure();
+      }
+    }
+    rewriter.moveOpBefore(loop, terminator);
+    return success();
+  }
+};
+
+// A gather's indices, mask and pass-through distribute elementwise, but its
+// memory operand does not. The upstream warp elementwise pattern excludes it.
+struct WarpOpGather final : gpu::WarpDistributionPattern {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(gpu::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override {
+    OpOperand *yieldOperand = getWarpResult(warpOp, [](Operation *op) {
+      return isa<vector::GatherOp>(op) && op->hasOneUse();
+    });
+    if (!yieldOperand) {
+      return failure();
+    }
+    auto gather = yieldOperand->get().getDefiningOp<vector::GatherOp>();
+    if (!isa<MemRefType>(gather.getBase().getType()) ||
+        !warpOp.isDefinedOutsideOfRegion(gather.getBase())) {
+      return failure();
+    }
+    for (Operation *op = gather->getNextNode(); op != warpOp.getTerminator();
+         op = op->getNextNode()) {
+      auto effects = getEffectsRecursively(op);
+      if (!effects || llvm::any_of(*effects, [](auto effect) {
+            return !isa<MemoryEffects::Read>(effect.getEffect());
+          })) {
+        return failure();
+      }
+    }
+    unsigned resultIndex = yieldOperand->getOperandNumber();
+    auto distributedType =
+        dyn_cast<VectorType>(warpOp.getResult(resultIndex).getType());
+    if (!distributedType ||
+        distributedType.getRank() != gather.getVectorType().getRank()) {
+      return failure();
+    }
+
+    SmallVector<Value> values(gather->operand_begin() + 1,
+                              gather->operand_end());
+    SmallVector<Type> types;
+    for (Value value : values) {
+      if (auto vectorType = dyn_cast<VectorType>(value.getType())) {
+        types.push_back(vectorType.cloneWith(distributedType.getShape(),
+                                             vectorType.getElementType()));
+      } else {
+        types.push_back(value.getType());
+      }
+    }
+    SmallVector<size_t> resultIndices;
+    auto newWarpOp = moveRegionToNewWarpOpAndAppendReturns(
+        rewriter, warpOp, values, types, resultIndices);
+    SmallVector<Value> operands;
+    for (size_t index : resultIndices) {
+      operands.push_back(newWarpOp.getResult(index));
+    }
+    rewriter.setInsertionPointAfter(newWarpOp);
+    auto newGather = vector::GatherOp::create(
+        rewriter, gather.getLoc(), distributedType, gather.getBase(),
+        ValueRange(operands).take_front(gather.getOffsets().size()),
+        operands[operands.size() - 3], operands[operands.size() - 2],
+        operands.back(), gather.getAlignmentAttr());
+    rewriter.replaceAllUsesWith(newWarpOp.getResult(resultIndex),
+                                newGather.getResult());
+    return success();
+  }
+};
+
 static void debugPrint(Operation *op, const char *message) {
   LLVM_DEBUG({
     llvm::dbgs() << "//--- " << message << " ---//\n";
@@ -242,6 +347,8 @@ struct VectorReductionToGPUPass final
       vector::ShapeCastOp::getCanonicalizationPatterns(patterns, ctx);
       vector::BroadcastOp::getCanonicalizationPatterns(patterns, ctx);
       vector::ExtractOp::getCanonicalizationPatterns(patterns, ctx);
+      vector::populateSinkVectorOpsPatterns(patterns);
+      vector::populateSinkVectorMemOpsPatterns(patterns);
       (void)applyPatternsGreedily(getOperation(), std::move(patterns));
     }
 
@@ -369,6 +476,8 @@ struct VectorReductionToGPUPass final
       vector::populatePropagateWarpVectorDistributionPatterns(
           patterns, distributionFn, simpleWarpShuffleFunction);
       vector::populateDistributeReduction(patterns, groupReductionFn);
+      patterns.add<WarpOpGather>(ctx, /*benefit=*/0);
+      patterns.add<WarpOpReadOnlyLoop>(ctx);
 
       // We don't want to sink large transfer writes to a single lane -- pick a
       // conservative value based on the group size.

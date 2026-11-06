@@ -70,6 +70,7 @@ iree_lit_test_suite(
     "reduce_bank_conflicts.mlir"
     "transform_gpu_distribute_shared_memory.mlir"
     "transform_gpu_reduce_bank_conflicts.mlir"
+    "vector_gather_distribution.mlir"
     "vector_reduction_to_gpu.mlir"
   TOOLS
     FileCheck

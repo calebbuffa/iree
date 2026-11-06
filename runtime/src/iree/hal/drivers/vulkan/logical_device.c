@@ -651,6 +651,20 @@ static iree_status_t iree_hal_vulkan_logical_device_query_i64(
     } else if (iree_string_view_equal(key, IREE_SV("subgroup_size"))) {
       *out_value = device->physical_device.subgroup_properties.subgroupSize;
       return iree_ok_status();
+    } else if (iree_string_view_equal(key,
+                                      IREE_SV("subgroup_supported_stages"))) {
+      *out_value = device->physical_device.subgroup_properties.supportedStages;
+      return iree_ok_status();
+    } else if (iree_string_view_equal(
+                   key, IREE_SV("subgroup_supported_operations"))) {
+      *out_value =
+          device->physical_device.subgroup_properties.supportedOperations;
+      return iree_ok_status();
+    } else if (iree_string_view_equal(
+                   key, IREE_SV("max_compute_shared_memory_size"))) {
+      *out_value = device->physical_device.properties2.properties.limits
+                       .maxComputeSharedMemorySize;
+      return iree_ok_status();
     } else if (iree_string_view_equal(
                    key, IREE_SV("max_compute_workgroup_invocations"))) {
       *out_value = device->physical_device.properties2.properties.limits

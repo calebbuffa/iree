@@ -61,6 +61,7 @@ iree_lit_test_suite(
     "pipeline_matmul_promotion.mlir"
     "pipeline_matmul_vectorization.mlir"
     "pipeline_matvec.mlir"
+    "pipeline_predicate_reduction.mlir"
     "pipeline_reduction_subgroup.mlir"
     "pipeline_sub_byte_dequant.mlir"
     "tile_and_distribute.mlir"

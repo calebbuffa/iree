@@ -165,6 +165,14 @@ typedef enum iree_hal_vulkan_feature_bits_t {
 
 typedef uint32_t iree_hal_vulkan_features_t;
 
+// Vulkan devices support iree_hal_device_query_i64 with category "vulkan.device":
+//   api_version, subgroup_size, subgroup_supported_stages (VkShaderStageFlags),
+//   subgroup_supported_operations (VkSubgroupFeatureFlags),
+//   max_compute_shared_memory_size, max_compute_workgroup_invocations,
+//   max_compute_workgroup_size_{x,y,z}, max_compute_workgroup_count_{x,y,z}.
+// Category "vulkan.feature" reports logical-device enabled features, not merely
+// physical support. These metadata queries do not submit or wait for device work.
+
 // Recognized device extension bits cached from device enumeration.
 typedef enum iree_hal_vulkan_device_extension_bits_t {
   // No recognized device extensions.

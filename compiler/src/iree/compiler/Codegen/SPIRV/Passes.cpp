@@ -305,6 +305,11 @@ void addSPIRVBaseLoweringPassPipeline(OpPassManager &funcPassManager) {
 void addSPIRVBaseDistributePassPipeline(OpPassManager &funcPassManager) {
   addTileAndDistributeToWorkgroupsPasses(funcPassManager);
 
+  // Unsupported reduction combiners still need their elementwise inputs fused;
+  // otherwise bufferization materializes the entire input in workgroup memory.
+  funcPassManager.addPass(createRematerializeParallelOpsPass());
+  funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
+
   addBufferizePasses(funcPassManager, gpuAllocateWorkgroupMemoryFn);
 
   // Tile and distribute to GPU invocations.
