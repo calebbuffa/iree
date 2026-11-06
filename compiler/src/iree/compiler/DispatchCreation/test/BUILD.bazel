@@ -23,6 +23,7 @@ iree_lit_test_suite(
             "bubble_up_expand_shapes.mlir",
             "bubble_up_extract_slice.mlir",
             "clone_producers_into_dispatch_regions.mlir",
+            "clone_strided_slice_producers.mlir",
             "collapse_contraction_dimensions.mlir",
             "collapse_contraction_dimensions_scope.mlir",
             "collapse_dimensions.mlir",

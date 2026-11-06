@@ -961,12 +961,11 @@ static bool isUnfusableInit(OpOperand &operand) {
   return fusionOp && !fusionOp.getMatchingIndexingMap(&operand);
 }
 
-/// Collects values whose producers materialize a tensor write feeding an
-/// init that cannot be fused through (scatter's `original`,
-/// insert_slice's `dest`, ...). Such producers must stay out of the dispatch.
+/// Collects tensor computations that cannot tile and fuse into the dispatch.
 static llvm::DenseSet<Value>
-collectUnfusableInitSources(IREE::Flow::DispatchRegionOp regionOp,
-                            CloneableIntoDispatchOptions options) {
+collectUnfusableTensorSources(IREE::Flow::DispatchRegionOp regionOp,
+                              const llvm::SetVector<Value> &valuesDefinedAbove,
+                              CloneableIntoDispatchOptions options) {
   BackwardSliceOptions sliceOpts;
   sliceOpts.omitUsesFromAbove = false;
   sliceOpts.omitBlockArguments = true;
@@ -976,13 +975,32 @@ collectUnfusableInitSources(IREE::Flow::DispatchRegionOp regionOp,
   };
 
   SetVector<Operation *> slice;
-  regionOp.getBody().walk([&](Operation *op) {
+  auto collectSources = [&](Operation *op) {
     for (OpOperand &operand : op->getOpOperands()) {
       if (isUnfusableInit(operand)) {
         (void)getBackwardSlice(operand.get(), &slice, sliceOpts);
       }
     }
-  });
+    // Producer tiling only supports unit-stride slices. Keep computations
+    // upstream of a strided slice in their own dispatch instead of cloning
+    // them into a consumer where they would remain untiled and could vectorize
+    // at full tensor size. The slice itself can still fold into a buffer load.
+    if (auto extract = dyn_cast<tensor::ExtractSliceOp>(op);
+        extract && !extract.hasUnitStride()) {
+      (void)getBackwardSlice(extract.getSource(), &slice, sliceOpts);
+    }
+  };
+  regionOp.getBody().walk(collectSources);
+
+  // Slices may themselves be cloned from outside the region. Inspect that
+  // closure before selecting producers, including values reached by other uses.
+  SetVector<Operation *> cloneableOps;
+  for (Value value : valuesDefinedAbove) {
+    (void)getBackwardSlice(value, &cloneableOps, sliceOpts);
+  }
+  for (Operation *op : cloneableOps) {
+    collectSources(op);
+  }
 
   llvm::DenseSet<Value> sources;
   for (Operation *sliceOp : slice) {
@@ -1002,8 +1020,8 @@ collectUnfusableInitSources(IREE::Flow::DispatchRegionOp regionOp,
 /// Checks if the `Value` has a use within the dispatch that is unfusable.
 static bool
 hasUnfusableUseInDispatch(Value v, Operation *dispatchOp,
-                          const llvm::DenseSet<Value> &unfusableInitSources) {
-  if (unfusableInitSources.contains(v)) {
+                          const llvm::DenseSet<Value> &unfusableTensorSources) {
+  if (unfusableTensorSources.contains(v)) {
     return true;
   }
   for (OpOperand &use : v.getUses()) {
@@ -1045,8 +1063,8 @@ SmallVector<Operation *> getCloneableOps(IREE::Flow::DispatchRegionOp regionOp,
     return {};
   }
 
-  llvm::DenseSet<Value> unfusableInitSources =
-      collectUnfusableInitSources(regionOp, options);
+  llvm::DenseSet<Value> unfusableTensorSources =
+      collectUnfusableTensorSources(regionOp, valuesDefinedAbove, options);
 
   // Traverse the defining ops of these values (and the ops on their reverse
   // SSA use-def chain).
@@ -1066,7 +1084,7 @@ SmallVector<Operation *> getCloneableOps(IREE::Flow::DispatchRegionOp regionOp,
     if (!definingOp ||
         !IREE::Flow::isCloneableIntoDispatchOp(definingOp, options) ||
         hasUnfusableUseInDispatch(outsideValue, regionOp,
-                                  unfusableInitSources)) {
+                                  unfusableTensorSources)) {
       valuesDefinedAbove.insert(outsideValue);
       continue;
     }
