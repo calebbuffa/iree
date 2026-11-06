@@ -309,10 +309,29 @@ struct WarpOpBarrier final : OpRewritePattern<gpu::WarpExecuteOnLane0Op> {
 };
 
 static Value simpleWarpShuffleFunction(Location loc, OpBuilder &builder,
-                                       Value val, Value srcIdx,
-                                       int64_t warpSz) {
+                                       Value val, Value srcIdx, int64_t warpSz,
+                                       int64_t subgroupSize) {
   assert((val.getType().isF32() || val.getType().isInteger(32)) &&
          "unsupported shuffle type");
+  if (warpSz != subgroupSize) {
+    // Warp distribution may span a whole workgroup. A hardware shuffle cannot
+    // communicate across its subgroups (or represent a smaller SPIR-V width).
+    auto addressSpace = gpu::AddressSpaceAttr::get(
+        builder.getContext(), gpu::GPUDialect::getWorkgroupAddressSpace());
+    auto type = MemRefType::get({warpSz}, val.getType(),
+                                MemRefLayoutAttrInterface{}, addressSpace);
+    Value shared = memref::AllocOp::create(builder, loc, type);
+    Value thread = gpu::ThreadIdOp::create(builder, loc, builder.getIndexType(),
+                                           gpu::Dimension::x);
+    memref::StoreOp::create(builder, loc, val, shared, ValueRange{thread});
+    gpu::BarrierOp::create(builder, loc, gpu::AddressSpace::Workgroup);
+    Value result =
+        memref::LoadOp::create(builder, loc, shared, ValueRange{srcIdx});
+    // The allocation can become static workgroup storage. Finish all reads
+    // before a following loop iteration can overwrite that storage.
+    gpu::BarrierOp::create(builder, loc, gpu::AddressSpace::Workgroup);
+    return result;
+  }
   Type i32Type = builder.getIntegerType(32);
   Value srcIdxI32 = arith::IndexCastOp::create(builder, loc, i32Type, srcIdx);
   Value warpSzI32 = arith::ConstantOp::create(
@@ -473,8 +492,13 @@ struct VectorReductionToGPUPass final
       };
 
       RewritePatternSet patterns(ctx);
+      auto shuffleFn = [subgroupSize](Location loc, OpBuilder &builder,
+                                      Value val, Value srcIdx, int64_t warpSz) {
+        return simpleWarpShuffleFunction(loc, builder, val, srcIdx, warpSz,
+                                         *subgroupSize);
+      };
       vector::populatePropagateWarpVectorDistributionPatterns(
-          patterns, distributionFn, simpleWarpShuffleFunction);
+          patterns, distributionFn, shuffleFn);
       vector::populateDistributeReduction(patterns, groupReductionFn);
       patterns.add<WarpOpGather>(ctx, /*benefit=*/0);
       patterns.add<WarpOpReadOnlyLoop>(ctx);
