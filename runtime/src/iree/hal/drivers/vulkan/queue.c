@@ -61,6 +61,11 @@ struct iree_hal_vulkan_queue_command_buffer_block_t {
   // Command pool backing command_buffers.
   VkCommandPool pool;
 
+  // Vulkan requires external synchronization of a pool even when different
+  // command buffers are recorded. Hold across reset or the entire recording.
+  // Acquire after submission_mutex; never acquire submission_mutex while held.
+  iree_slim_mutex_t recording_mutex;
+
   // Primary command buffers leased by one-shot queue submissions.
   VkCommandBuffer
       command_buffers[IREE_HAL_VULKAN_QUEUE_COMMAND_BUFFER_BLOCK_CAPACITY];
@@ -1703,6 +1708,7 @@ static iree_status_t iree_hal_vulkan_queue_command_buffer_block_create(
   IREE_RETURN_IF_ERROR(iree_allocator_malloc(queue->host_allocator,
                                              sizeof(*block), (void**)&block));
   memset(block, 0, sizeof(*block));
+  iree_slim_mutex_initialize(&block->recording_mutex);
   block->free_count = IREE_HAL_VULKAN_QUEUE_COMMAND_BUFFER_BLOCK_CAPACITY;
 
   iree_status_t status = iree_hal_vulkan_queue_create_command_pool(
@@ -1728,6 +1734,7 @@ static iree_status_t iree_hal_vulkan_queue_command_buffer_block_create(
                                 queue->logical_device, block->pool,
                                 /*pAllocator=*/NULL);
     }
+    iree_slim_mutex_deinitialize(&block->recording_mutex);
     iree_allocator_free(queue->host_allocator, block);
   }
   return status;
@@ -1742,6 +1749,7 @@ static void iree_hal_vulkan_queue_command_buffer_block_destroy(
                               queue->logical_device, block->pool,
                               /*pAllocator=*/NULL);
   }
+  iree_slim_mutex_deinitialize(&block->recording_mutex);
   iree_allocator_free(queue->host_allocator, block);
 }
 
@@ -1778,9 +1786,12 @@ static iree_status_t iree_hal_vulkan_queue_reset_command_buffer_cache_slot(
     iree_hal_vulkan_queue_t* queue,
     iree_hal_vulkan_queue_command_buffer_block_t* block, uint32_t slot) {
   if (!block->needs_reset[slot]) return iree_ok_status();
-  IREE_RETURN_IF_ERROR(iree_vkResetCommandBuffer(
+  iree_slim_mutex_lock(&block->recording_mutex);
+  iree_status_t status = iree_vkResetCommandBuffer(
       IREE_VULKAN_DEVICE(&queue->syms), block->command_buffers[slot],
-      /*flags=*/0));
+      /*flags=*/0);
+  iree_slim_mutex_unlock(&block->recording_mutex);
+  IREE_RETURN_IF_ERROR(status);
   block->needs_reset[slot] = false;
   return iree_ok_status();
 }
@@ -2232,12 +2243,15 @@ static iree_status_t iree_hal_vulkan_queue_create_native_replay_under_lock(
       iree_hal_vulkan_queue_bda_publication_for_lease(
           &replay->bda_publication_lease);
   if (iree_status_is_ok(status)) {
+    iree_slim_mutex_lock(&replay->command_buffer_lease.block->recording_mutex);
     status = iree_hal_vulkan_command_buffer_record_native(
         command_buffer, &queue->syms, queue->logical_device,
         &queue->debug_utils, queue->builtins, replay->native_command_buffer,
         /*usage_flags=*/0, VK_NULL_HANDLE, binding_table,
         publication_length != 0 ? &publication : NULL, bda_binding_cache,
         /*profile_marker=*/NULL, queue->host_allocator);
+    iree_slim_mutex_unlock(
+        &replay->command_buffer_lease.block->recording_mutex);
   }
   if (iree_status_is_ok(status)) {
     status = iree_hal_vulkan_queue_flush_bda_publication_lease(
@@ -3961,6 +3975,37 @@ static iree_status_t iree_hal_vulkan_queue_expand_fill_pattern(
   return iree_ok_status();
 }
 
+// Success holds the pool lock until end_native_recording, including error
+// exits.
+static iree_status_t iree_hal_vulkan_queue_begin_native_recording(
+    iree_hal_vulkan_queue_t* queue,
+    const iree_hal_vulkan_queue_pending_submission_t* submission,
+    const VkCommandBufferBeginInfo* begin_info) {
+  iree_slim_mutex_t* mutex =
+      &submission->native_command_buffer_lease.block->recording_mutex;
+  iree_slim_mutex_lock(mutex);
+  iree_status_t status =
+      iree_vkBeginCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
+                                submission->native_command_buffer, begin_info);
+  if (!iree_status_is_ok(status)) {
+    iree_slim_mutex_unlock(mutex);
+  }
+  return status;
+}
+
+static iree_status_t iree_hal_vulkan_queue_end_native_recording(
+    iree_hal_vulkan_queue_t* queue,
+    const iree_hal_vulkan_queue_pending_submission_t* submission,
+    iree_status_t status) {
+  if (iree_status_is_ok(status)) {
+    status = iree_vkEndCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
+                                     submission->native_command_buffer);
+  }
+  iree_slim_mutex_unlock(
+      &submission->native_command_buffer_lease.block->recording_mutex);
+  return status;
+}
+
 static iree_status_t iree_hal_vulkan_queue_record_fill_native(
     iree_hal_vulkan_queue_t* queue,
     iree_hal_vulkan_queue_pending_submission_t* submission) {
@@ -4018,20 +4063,23 @@ static iree_status_t iree_hal_vulkan_queue_record_fill_native(
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
   };
-  IREE_RETURN_IF_ERROR(iree_vkBeginCommandBuffer(
-      IREE_VULKAN_DEVICE(&queue->syms), submission->native_command_buffer,
-      &begin_info));
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_queue_begin_native_recording(
+      queue, submission, &begin_info));
   iree_hal_vulkan_queue_profile_reset_native_timestamps(queue, submission);
   iree_hal_vulkan_queue_profile_write_timestamp_begin(queue, submission);
   VkDeviceSize fill_offset = (VkDeviceSize)target_offset;
   VkDeviceSize fill_length = (VkDeviceSize)submission->fill.length;
   if (needs_unaligned_fill) {
-    IREE_RETURN_IF_ERROR(
+    iree_status_t status =
         iree_hal_vulkan_builtins_record_fill_unaligned_descriptor_sets(
             queue->builtins, submission->native_command_buffer, descriptor_sets,
             descriptor_set_count, target_handle, (VkDeviceSize)target_offset,
             (VkDeviceSize)submission->fill.length, submission->fill.pattern,
-            submission->fill.pattern_length));
+            submission->fill.pattern_length);
+    if (!iree_status_is_ok(status)) {
+      return iree_hal_vulkan_queue_end_native_recording(queue, submission,
+                                                        status);
+    }
     const VkDeviceSize target_end =
         (VkDeviceSize)target_offset + (VkDeviceSize)submission->fill.length;
     const VkDeviceSize aligned_target_offset =
@@ -4051,8 +4099,8 @@ static iree_status_t iree_hal_vulkan_queue_record_fill_native(
                          fill_offset, fill_length, pattern);
   }
   iree_hal_vulkan_queue_profile_write_timestamp_end(queue, submission);
-  return iree_vkEndCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
-                                 submission->native_command_buffer);
+  return iree_hal_vulkan_queue_end_native_recording(queue, submission,
+                                                    iree_ok_status());
 }
 
 static void iree_hal_vulkan_queue_execute_fill(
@@ -4153,22 +4201,25 @@ static iree_status_t iree_hal_vulkan_queue_record_update_native(
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
   };
-  IREE_RETURN_IF_ERROR(iree_vkBeginCommandBuffer(
-      IREE_VULKAN_DEVICE(&queue->syms), submission->native_command_buffer,
-      &begin_info));
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_queue_begin_native_recording(
+      queue, submission, &begin_info));
   iree_hal_vulkan_queue_profile_reset_native_timestamps(queue, submission);
   iree_hal_vulkan_queue_profile_write_timestamp_begin(queue, submission);
   VkDeviceSize update_offset = (VkDeviceSize)target_offset;
   VkDeviceSize update_length = (VkDeviceSize)submission->update.length;
   iree_host_size_t source_data_offset = 0;
   if (needs_unaligned_update) {
-    IREE_RETURN_IF_ERROR(
+    iree_status_t status =
         iree_hal_vulkan_builtins_record_update_unaligned_descriptor_sets(
             queue->builtins, submission->native_command_buffer, descriptor_sets,
             descriptor_set_count, target_handle, (VkDeviceSize)target_offset,
             (VkDeviceSize)submission->update.length,
             submission->update.source_data,
-            (iree_host_size_t)submission->update.length));
+            (iree_host_size_t)submission->update.length);
+    if (!iree_status_is_ok(status)) {
+      return iree_hal_vulkan_queue_end_native_recording(queue, submission,
+                                                        status);
+    }
     const VkDeviceSize target_end =
         (VkDeviceSize)target_offset + (VkDeviceSize)submission->update.length;
     const VkDeviceSize aligned_target_offset =
@@ -4184,12 +4235,13 @@ static iree_status_t iree_hal_vulkan_queue_record_update_native(
           (iree_host_size_t)(aligned_target_offset - target_offset);
     }
   }
-  IREE_RETURN_IF_ERROR(iree_hal_vulkan_queue_record_update_chunks(
+  iree_status_t status = iree_hal_vulkan_queue_record_update_chunks(
       queue, submission->native_command_buffer, target_handle, update_offset,
-      update_length, submission->update.source_data, source_data_offset));
-  iree_hal_vulkan_queue_profile_write_timestamp_end(queue, submission);
-  return iree_vkEndCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
-                                 submission->native_command_buffer);
+      update_length, submission->update.source_data, source_data_offset);
+  if (iree_status_is_ok(status)) {
+    iree_hal_vulkan_queue_profile_write_timestamp_end(queue, submission);
+  }
+  return iree_hal_vulkan_queue_end_native_recording(queue, submission, status);
 }
 
 static iree_status_t iree_hal_vulkan_queue_can_record_update_native(
@@ -4268,8 +4320,8 @@ static iree_status_t iree_hal_vulkan_queue_record_copy_native_buffers(
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
   };
-  IREE_RETURN_IF_ERROR(iree_vkBeginCommandBuffer(
-      IREE_VULKAN_DEVICE(&queue->syms), command_buffer, &begin_info));
+  IREE_RETURN_IF_ERROR(iree_hal_vulkan_queue_begin_native_recording(
+      queue, submission, &begin_info));
   if (submission) {
     iree_hal_vulkan_queue_profile_reset_native_timestamps(queue, submission);
     iree_hal_vulkan_queue_profile_write_timestamp_begin(queue, submission);
@@ -4285,8 +4337,8 @@ static iree_status_t iree_hal_vulkan_queue_record_copy_native_buffers(
   if (submission) {
     iree_hal_vulkan_queue_profile_write_timestamp_end(queue, submission);
   }
-  return iree_vkEndCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
-                                 command_buffer);
+  return iree_hal_vulkan_queue_end_native_recording(queue, submission,
+                                                    iree_ok_status());
 }
 
 static iree_status_t iree_hal_vulkan_queue_record_copy_native(
@@ -8640,9 +8692,8 @@ static iree_status_t iree_hal_vulkan_queue_record_dispatch_descriptor_native(
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    status = iree_vkBeginCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
-                                       submission->native_command_buffer,
-                                       &begin_info);
+    status = iree_hal_vulkan_queue_begin_native_recording(queue, submission,
+                                                          &begin_info);
   }
   if (iree_status_is_ok(status)) {
     iree_hal_vulkan_queue_profile_reset_native_timestamps(queue, submission);
@@ -8701,8 +8752,8 @@ static iree_status_t iree_hal_vulkan_queue_record_dispatch_descriptor_native(
                                 submission->profile.dispatch_base_query + 1);
     }
     iree_hal_vulkan_queue_profile_write_timestamp_end(queue, submission);
-    status = iree_vkEndCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
-                                     submission->native_command_buffer);
+    status = iree_hal_vulkan_queue_end_native_recording(queue, submission,
+                                                        iree_ok_status());
   }
 
   if (write_infos != inline_write_infos) {
@@ -8781,9 +8832,8 @@ static iree_status_t iree_hal_vulkan_queue_record_dispatch_bda_native(
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    status = iree_vkBeginCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
-                                       submission->native_command_buffer,
-                                       &begin_info);
+    status = iree_hal_vulkan_queue_begin_native_recording(queue, submission,
+                                                          &begin_info);
   }
   if (iree_status_is_ok(status)) {
     iree_hal_vulkan_queue_profile_reset_native_timestamps(queue, submission);
@@ -8858,8 +8908,8 @@ static iree_status_t iree_hal_vulkan_queue_record_dispatch_bda_native(
                                 submission->profile.dispatch_base_query + 1);
     }
     iree_hal_vulkan_queue_profile_write_timestamp_end(queue, submission);
-    status = iree_vkEndCommandBuffer(IREE_VULKAN_DEVICE(&queue->syms),
-                                     submission->native_command_buffer);
+    status = iree_hal_vulkan_queue_end_native_recording(queue, submission,
+                                                        iree_ok_status());
   }
   IREE_TRACE_ZONE_END(z0);
   return status;
@@ -9143,6 +9193,8 @@ static iree_status_t iree_hal_vulkan_queue_record_execute_native(
         .command_buffer_id =
             iree_hal_vulkan_queue_profile_command_buffer_id(submission),
     };
+    iree_slim_mutex_lock(
+        &submission->native_command_buffer_lease.block->recording_mutex);
     status = iree_hal_vulkan_command_buffer_record_native(
         submission->execute.command_buffer, &queue->syms, queue->logical_device,
         &queue->debug_utils, queue->builtins, submission->native_command_buffer,
@@ -9150,6 +9202,8 @@ static iree_status_t iree_hal_vulkan_queue_record_execute_native(
         binding_table, bda_publication_ptr, &bda_binding_cache,
         profile_marker.query_pool ? &profile_marker : NULL,
         queue->host_allocator);
+    iree_slim_mutex_unlock(
+        &submission->native_command_buffer_lease.block->recording_mutex);
   }
   if (iree_status_is_ok(status) && bda_publication_length != 0) {
     status = iree_hal_vulkan_queue_flush_bda_publication_lease(
