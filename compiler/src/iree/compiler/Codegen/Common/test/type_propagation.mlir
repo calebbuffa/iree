@@ -1,6 +1,45 @@
 // RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-codegen-type-propagation))" --split-input-file %s \
 // RUN: | FileCheck %s --implicit-check-not=packed_storage
 
+// CHECK-LABEL: func.func @scalar_bool_from_elements(
+// CHECK-SAME: %[[VALUE:.*]]: i1
+// CHECK: %[[EXT:.*]] = arith.extui %[[VALUE]] : i1 to i8
+// CHECK: %[[TENSOR:.*]] = tensor.from_elements %[[EXT]] : tensor<i8>
+// CHECK: return %[[TENSOR]] : tensor<i8>
+func.func @scalar_bool_from_elements(%value: i1) -> tensor<i8> {
+  %tensor = tensor.from_elements %value : tensor<i1>
+  %extended = arith.extui %tensor : tensor<i1> to tensor<i8>
+  return %extended : tensor<i8>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @narrow_from_elements(
+// CHECK-SAME: %[[A:.*]]: i7, %[[B:.*]]: i7
+// CHECK: %[[EXTA:.*]] = arith.extui %[[A]] : i7 to i8
+// CHECK: %[[EXTB:.*]] = arith.extui %[[B]] : i7 to i8
+// CHECK: %[[TENSOR:.*]] = tensor.from_elements %[[EXTA]], %[[EXTB]] : tensor<2xi8>
+// CHECK: return %[[TENSOR]] : tensor<2xi8>
+func.func @narrow_from_elements(%a: i7, %b: i7) -> tensor<2xi8> {
+  %tensor = tensor.from_elements %a, %b : tensor<2xi7>
+  %extended = arith.extui %tensor : tensor<2xi7> to tensor<2xi8>
+  return %extended : tensor<2xi8>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @legal_from_elements(
+// CHECK-SAME: %[[VALUE:.*]]: i32
+// CHECK-NOT: arith.extui
+// CHECK: %[[TENSOR:.*]] = tensor.from_elements %[[VALUE]] : tensor<i32>
+// CHECK: return %[[TENSOR]] : tensor<i32>
+func.func @legal_from_elements(%value: i32) -> tensor<i32> {
+  %tensor = tensor.from_elements %value : tensor<i32>
+  return %tensor : tensor<i32>
+}
+
+// -----
+
 #pipeline_layout = #hal.pipeline.layout<constants = 1, bindings = [
   #hal.pipeline.binding<storage_buffer>,
   #hal.pipeline.binding<storage_buffer>

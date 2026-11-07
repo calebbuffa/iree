@@ -152,6 +152,39 @@ TEST_P(DispatchTest, DispatchAbs) {
   iree_hal_buffer_release(input_buffer);
 }
 
+TEST_P(DispatchTest, ZeroWorkAllowsEmptyBindingRangesWithoutWriting) {
+  Ref<iree_hal_buffer_t> input_buffer;
+  Ref<iree_hal_buffer_t> output_buffer;
+  IREE_ASSERT_OK(CreateFilledDeviceBuffer<float>(
+      sizeof(float), -2.5f, input_buffer.out()));
+  IREE_ASSERT_OK(CreateFilledDeviceBuffer<float>(
+      sizeof(float), -9.0f, output_buffer.out()));
+  const iree_hal_buffer_ref_t refs[] = {
+      iree_hal_make_buffer_ref(input_buffer, 0, 0),
+      iree_hal_make_buffer_ref(output_buffer, 0, 0),
+  };
+  const iree_hal_buffer_ref_list_t bindings = {IREE_ARRAYSIZE(refs), refs};
+
+  for (int axis = 0; axis < 3; ++axis) {
+    auto config = iree_hal_make_static_dispatch_config(1, 1, 1);
+    config.workgroup_count[axis] = 0;
+    Ref<iree_hal_command_buffer_t> command_buffer;
+    IREE_ASSERT_OK(iree_hal_command_buffer_create(
+        device_, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+        IREE_HAL_COMMAND_CATEGORY_DISPATCH, IREE_HAL_QUEUE_AFFINITY_ANY,
+        /*binding_capacity=*/0, command_buffer.out()));
+    IREE_ASSERT_OK(iree_hal_command_buffer_begin(command_buffer));
+    IREE_ASSERT_OK(iree_hal_command_buffer_dispatch(
+        command_buffer, executable_, iree_hal_executable_function_from_index(0),
+        config, iree_const_byte_span_empty(), bindings,
+        IREE_HAL_DISPATCH_FLAG_NONE));
+    IREE_ASSERT_OK(iree_hal_command_buffer_end(command_buffer));
+    IREE_ASSERT_OK(SubmitCommandBufferAndWait(command_buffer));
+  }
+  EXPECT_THAT(ReadBufferData<float>(output_buffer),
+              ::testing::ElementsAre(-9.0f));
+}
+
 CTS_REGISTER_EXECUTABLE_COMMAND_BUFFER_TEST_SUITE(DispatchTest);
 
 }  // namespace iree::hal::cts

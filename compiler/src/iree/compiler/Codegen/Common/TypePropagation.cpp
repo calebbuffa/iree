@@ -365,6 +365,34 @@ struct TensorExtractTypePropagation
   }
 };
 
+/// Legalizes tensor construction together with its scalar element operands.
+struct TensorFromElementsTypePropagation
+    : TypePropagationPattern<tensor::FromElementsOp> {
+  using TypePropagationPattern<tensor::FromElementsOp>::TypePropagationPattern;
+
+  LogicalResult
+  matchAndRewrite(tensor::FromElementsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    auto resultType = dyn_cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
+    if (!resultType) {
+      return rewriter.notifyMatchFailure(op, "expected a converted tensor type");
+    }
+    SmallVector<Value> elements;
+    for (Value element : adaptor.getElements()) {
+      Value converted = convertElementType(
+          rewriter, op.getLoc(), resultType.getElementType(), element);
+      if (!converted) {
+        return rewriter.notifyMatchFailure(
+            op, "unsupported scalar element conversion");
+      }
+      elements.push_back(converted);
+    }
+    rewriter.replaceOpWithNewOp<tensor::FromElementsOp>(op, resultType, elements);
+    return success();
+  }
+};
+
 /// Pattern to legalize `iree_linalg_ext.scatter` operations.
 struct IREELinalgExtScatterTypePropagation
     : TypePropagationPattern<IREE::LinalgExt::ScatterOp> {
@@ -625,6 +653,7 @@ struct TypePropagationPass final
         NamedOpTypePropagation<linalg::MatmulOp>,
         NamedOpTypePropagation<linalg::MatvecOp>,
         NamedOpTypePropagation<linalg::DotOp>, TensorExtractTypePropagation,
+        TensorFromElementsTypePropagation,
         IREELinalgExtScatterTypePropagation, IREELinalgExtSortTypePropagation>(
         typeConverter, context);
 

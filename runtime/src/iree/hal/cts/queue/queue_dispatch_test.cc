@@ -102,6 +102,42 @@ TEST_P(QueueDispatchTest, DispatchWithConstantsAndBindings) {
   EXPECT_THAT(output_data, ContainerEq(std::vector<uint32_t>{13, 16, 19, 22}));
 }
 
+TEST_P(QueueDispatchTest, ZeroWorkAllowsEmptyRangesAndPreservesDependencies) {
+  Ref<iree_hal_buffer_t> input_buffer;
+  Ref<iree_hal_buffer_t> output_buffer;
+  IREE_ASSERT_OK(CreateFilledDeviceBuffer<uint32_t>(
+      sizeof(uint32_t), 2, input_buffer.out()));
+  IREE_ASSERT_OK(CreateFilledDeviceBuffer<uint32_t>(
+      sizeof(uint32_t), 99, output_buffer.out()));
+  const iree_hal_buffer_ref_t refs[] = {
+      iree_hal_make_buffer_ref(input_buffer, 0, 0),
+      iree_hal_make_buffer_ref(output_buffer, 0, 0),
+  };
+  const iree_hal_buffer_ref_list_t bindings = {IREE_ARRAYSIZE(refs), refs};
+  const uint32_t constant_data[] = {3, 10};
+  const auto constants =
+      iree_make_const_byte_span(constant_data, sizeof(constant_data));
+
+  for (int axis = 0; axis < 3; ++axis) {
+    auto config = iree_hal_make_static_dispatch_config(1, 1, 1);
+    config.workgroup_count[axis] = 0;
+    SemaphoreList gate(device_, {0}, {1});
+    SemaphoreList signal(device_, {0}, {1});
+    IREE_ASSERT_OK(iree_hal_device_queue_dispatch(
+        device_, IREE_HAL_QUEUE_AFFINITY_ANY, gate, signal, executable_,
+        iree_hal_executable_function_from_index(0), config, constants, bindings,
+        IREE_HAL_DISPATCH_FLAG_NONE));
+    uint64_t value = 0;
+    IREE_ASSERT_OK(iree_hal_semaphore_query(signal.semaphores[0], &value));
+    EXPECT_EQ(value, 0u);
+    IREE_ASSERT_OK(iree_hal_semaphore_list_signal(gate, /*frontier=*/nullptr));
+    IREE_ASSERT_OK(iree_hal_semaphore_list_wait(
+        signal, iree_infinite_timeout(), IREE_ASYNC_WAIT_FLAG_NONE));
+  }
+  EXPECT_THAT(ReadBufferData<uint32_t>(output_buffer),
+              ::testing::ElementsAre(99));
+}
+
 // Borrowed resource lifetimes are an optimization hint for callers that keep
 // resources live until dispatch completion. The observable dispatch behavior is
 // identical to the default retained mode.

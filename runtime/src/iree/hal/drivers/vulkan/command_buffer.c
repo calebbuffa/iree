@@ -2948,6 +2948,14 @@ static iree_status_t iree_hal_vulkan_command_buffer_dispatch(
     }
   }
 
+  // Empty direct grids access no bindings. Do not realize Vulkan descriptors
+  // for empty ranges; indirect grids cannot be decided without execution.
+  if (!iree_hal_dispatch_uses_indirect_parameters(flags) &&
+      (config.workgroup_count[0] == 0 || config.workgroup_count[1] == 0 ||
+       config.workgroup_count[2] == 0)) {
+    return iree_ok_status();
+  }
+
   IREE_RETURN_IF_ERROR(iree_hal_vulkan_command_buffer_retain_resource(
       command_buffer, executable));
   IREE_RETURN_IF_ERROR(iree_hal_vulkan_command_buffer_track_buffer_refs(

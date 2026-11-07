@@ -9046,6 +9046,15 @@ iree_status_t iree_hal_vulkan_queue_submit_dispatch(
         signal_semaphore_list, IREE_SV("signal"));
   }
 
+  if (iree_status_is_ok(status) &&
+      !iree_hal_dispatch_uses_indirect_parameters(flags) &&
+      (config.workgroup_count[0] == 0 || config.workgroup_count[1] == 0 ||
+       config.workgroup_count[2] == 0)) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_hal_vulkan_queue_submit_barrier(queue, wait_semaphore_list,
+                                               signal_semaphore_list);
+  }
+
   iree_host_size_t dispatch_payload_storage_length = 0;
   iree_host_size_t dispatch_constants_data_offset = 0;
   iree_host_size_t dispatch_bindings_offset = 0;
