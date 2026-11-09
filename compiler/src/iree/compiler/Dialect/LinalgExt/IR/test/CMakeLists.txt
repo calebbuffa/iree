@@ -16,6 +16,7 @@ iree_lit_test_suite(
   SRCS
     "canonicalize.mlir"
     "decompose_aggregate_op.mlir"
+    "gather_scatter_batch_shapes.mlir"
     "invalid.mlir"
     "roundtrip.mlir"
   TOOLS

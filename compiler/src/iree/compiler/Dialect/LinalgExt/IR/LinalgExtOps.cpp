@@ -217,15 +217,17 @@ verifyGatherScatter(OpTy op, int64_t sliceRank, ShapedType originalType,
   }
 
   {
-    // Validate the shape of indices and update value match for the first
-    // `batchRank` dims.
-    auto [indicesIt, updateIt] =
-        llvm::mismatch(indicesType.getShape().take_front(batchRank),
-                       updateType.getShape().take_front(batchRank));
-    if (indicesIt != indicesType.getShape().take_front(batchRank).end()) {
-      return op->emitOpError("mismatch in shape of indices and " + updateName +
-                             " value at dim#")
-             << (indicesIt - indicesType.getShape().begin());
+    // Batch extents must agree at runtime, but their types can be refined
+    // independently. Only conflicting static extents prove a mismatch.
+    for (auto dim : llvm::seq<int64_t>(0, static_cast<int64_t>(batchRank))) {
+      if (indicesType.isDynamicDim(dim) || updateType.isDynamicDim(dim)) {
+        continue;
+      }
+      if (indicesType.getDimSize(dim) != updateType.getDimSize(dim)) {
+        return op->emitOpError("mismatch in shape of indices and " + updateName +
+                               " value at dim#")
+               << dim;
+      }
     }
   }
   if (batchRank + 1 < indicesType.getShape().size() &&

@@ -80,7 +80,8 @@ def IREELinalgExt_ScatterOp : IREELinalgExt_Op<"scatter",
 
     The operand `update` is a M-D tensor/memref type and similarly
     consists of two parts. The first `N-1` dimensions represent the batch of
-    updates. This must exactly match to the first `N-1` dimensions in `indices`.
+    updates. Their runtime extents must exactly match the first `N-1`
+    dimensions in `indices`; static and dynamic type information may differ.
     Dimensions `N..M-1` represent the slice scattered into `original`,
     `update_slice`, and must match the last dimensions in original. This
     represents a contiguous slice to be inserted into `original`.
