@@ -610,8 +610,9 @@ struct ConvertOpCanon final : OpRewritePattern<mlir::stablehlo::ConvertOp> {
 //
 /// Oftentimes, this works just fine because HLO is designed to accommodate
 /// this kind of type refinements. But sometimes, this doesn't work - when
-/// the op is used outside of the HLO dialect (e.g. in func.return). In these
-/// cases, we insert a tensor.cast to smooth things out.
+/// the op is used outside of the HLO dialect (e.g. in func.return) or across
+/// an HLO region terminator (e.g. stablehlo.return in if/while regions). In
+/// these cases, we insert a tensor.cast to preserve the enclosing type.
 template <typename OpTy, typename... Args>
 static OpTy refineOpWithNewOp(PatternRewriter &rewriter, Operation *op,
                               Args &&...args) {
@@ -624,8 +625,10 @@ static OpTy refineOpWithNewOp(PatternRewriter &rewriter, Operation *op,
   for (auto [opResult, newOpResult] :
        llvm::zip(op->getResults(), newOp->getResults())) {
     Value replacementResult = newOpResult;
-    if (llvm::any_of(opResult.getUsers(), [&](Operation *user) {
-          return user->getDialect() != op->getDialect();
+    if (newOpResult.getType() != opResult.getType() &&
+        llvm::any_of(opResult.getUsers(), [&](Operation *user) {
+          return user->getDialect() != op->getDialect() ||
+                 isa<mlir::stablehlo::ReturnOp>(user);
         })) {
       replacementResult = mlir::tensor::CastOp::create(
           rewriter, op->getLoc(), opResult.getType(), newOpResult);

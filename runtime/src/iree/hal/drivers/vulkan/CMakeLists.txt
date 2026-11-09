@@ -34,6 +34,7 @@ iree_cc_library(
     "executable.h"
     "physical_device.h"
     "physical_device_selection.h"
+    "queue.h"
     "spirv.h"
   DEPS
     ::api
@@ -170,6 +171,24 @@ iree_cc_test(
     ::headers
     ::vulkan
     iree::base
+    iree::testing::gtest
+    iree::testing::gtest_main
+  GROUP
+    "iree-hal-drivers-vulkan-tests"
+)
+
+iree_cc_test(
+  NAME
+    queue_test
+  SRCS
+    "queue_test.cc"
+  DEPS
+    ::headers
+    ::vulkan
+    iree::async
+    iree::async::platform
+    iree::base
+    iree::hal
     iree::testing::gtest
     iree::testing::gtest_main
   GROUP

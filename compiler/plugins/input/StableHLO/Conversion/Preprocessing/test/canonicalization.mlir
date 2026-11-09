@@ -1,4 +1,5 @@
 // RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-stablehlo-canonicalize))" --allow-unregistered-dialect --split-input-file %s | FileCheck %s
+// RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-stablehlo-canonicalize,iree-stablehlo-legalize-control-flow))" --allow-unregistered-dialect --split-input-file %s | FileCheck %s --check-prefix=CF
 
 // CHECK-LABEL: func.func @add
 // CHECK-SAME:   ([[ARG0:%.+]]: tensor<2xi32>, [[ARG1:%.+]]: tensor<f32>)
@@ -795,3 +796,68 @@ func.func @generic_op(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> tensor<2xf3
 // CHECK-LABEL: func.func @generic_op
 // CHECK-NEXT:    "test_dialect.op"
 // CHECK-NEXT:    return
+
+// -----
+
+func.func @dynamic_broadcast_if_return(
+    %pred: tensor<i1>, %input: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %zero = stablehlo.constant dense<0.0> : tensor<f32>
+  %sizes = stablehlo.constant dense<0> : tensor<2xi64>
+  %result = "stablehlo.if"(%pred) ({
+    "stablehlo.return"(%input) : (tensor<?x?xf32>) -> ()
+  }, {
+    %broadcast = "stablehlo.dynamic_broadcast_in_dim"(%zero, %sizes) <{broadcast_dimensions = array<i64>}> : (tensor<f32>, tensor<2xi64>) -> tensor<?x?xf32>
+    "stablehlo.return"(%broadcast) : (tensor<?x?xf32>) -> ()
+  }) : (tensor<i1>) -> tensor<?x?xf32>
+  return %result : tensor<?x?xf32>
+}
+
+// CHECK-LABEL: func.func @dynamic_broadcast_if_return
+// CHECK: stablehlo.if
+// CHECK: tensor.cast {{.*}} : tensor<0x0xf32> to tensor<?x?xf32>
+// CHECK: stablehlo.return {{.*}} : tensor<?x?xf32>
+// CF-LABEL: func.func @dynamic_broadcast_if_return
+// CF: scf.if
+// CF: tensor.cast {{.*}} : tensor<0x0xf32> to tensor<?x?xf32>
+// CF: scf.yield {{.*}} : tensor<?x?xf32>
+
+// -----
+
+func.func @dynamic_broadcast_while_return(
+    %input: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %false = stablehlo.constant dense<false> : tensor<i1>
+  %sizes = stablehlo.constant dense<0> : tensor<2xi64>
+  %result = stablehlo.while(%iter = %input) : tensor<?x?xf32>
+   cond {
+    stablehlo.return %false : tensor<i1>
+  } do {
+    %zero = stablehlo.constant dense<0.0> : tensor<f32>
+    %broadcast = "stablehlo.dynamic_broadcast_in_dim"(%zero, %sizes) <{broadcast_dimensions = array<i64>}> : (tensor<f32>, tensor<2xi64>) -> tensor<?x?xf32>
+    stablehlo.return %broadcast : tensor<?x?xf32>
+  }
+  return %result : tensor<?x?xf32>
+}
+
+// CHECK-LABEL: func.func @dynamic_broadcast_while_return
+// CHECK: stablehlo.while
+// CHECK: tensor.cast {{.*}} : tensor<0x0xf32> to tensor<?x?xf32>
+// CHECK: stablehlo.return {{.*}} : tensor<?x?xf32>
+// CF-LABEL: func.func @dynamic_broadcast_while_return
+// CF: scf.while
+// CF: tensor.cast {{.*}} : tensor<0x0xf32> to tensor<?x?xf32>
+// CF: scf.yield {{.*}} : tensor<?x?xf32>
+
+// -----
+
+func.func @dynamic_broadcast_internal_refinement(
+    %input: tensor<1x1xf32>) -> tensor<?x?xf32> {
+  %sizes = stablehlo.constant dense<[2, 3]> : tensor<2xi64>
+  %broadcast = "stablehlo.dynamic_broadcast_in_dim"(%input, %sizes) <{broadcast_dimensions = array<i64: 0, 1>}> : (tensor<1x1xf32>, tensor<2xi64>) -> tensor<?x?xf32>
+  %abs = stablehlo.abs %broadcast : tensor<?x?xf32>
+  return %abs : tensor<?x?xf32>
+}
+
+// CHECK-LABEL: func.func @dynamic_broadcast_internal_refinement
+// CHECK: stablehlo.broadcast_in_dim {{.*}} : (tensor<1x1xf32>) -> tensor<2x3xf32>
+// CHECK-NOT: tensor.cast
+// CHECK: stablehlo.abs {{.*}} : (tensor<2x3xf32>) -> tensor<?x?xf32>

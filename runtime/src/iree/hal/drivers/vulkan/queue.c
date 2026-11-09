@@ -9426,6 +9426,28 @@ iree_host_size_t iree_hal_vulkan_queue_drain_completions(
 
   iree_hal_vulkan_queue_pending_submission_t* completed_head = NULL;
   iree_slim_mutex_lock(&queue->submission_mutex);
+  // Accepted submissions advance next_epoch_value under this same lock. Check
+  // after querying: a submission may have completed while the query was in
+  // flight. Device loss can produce VK_SUCCESS with UINT64_MAX instead of a
+  // valid epoch.
+  failure_status = (iree_status_t)iree_atomic_load(&queue->failure_status,
+                                                   iree_memory_order_acquire);
+  if (IREE_UNLIKELY(!iree_status_is_ok(failure_status) ||
+                    completed_epoch >= queue->next_epoch_value)) {
+    iree_status_t status = iree_status_clone(failure_status);
+    if (iree_status_is_ok(status)) {
+      status = iree_hal_vulkan_queue_store_error(
+          queue,
+          iree_make_status(IREE_STATUS_DATA_LOSS,
+                           "Vulkan reported unsignaled queue epoch %" PRIu64
+                           " (next epoch %" PRIu64 ")",
+                           completed_epoch, queue->next_epoch_value));
+    }
+    iree_slim_mutex_unlock(&queue->submission_mutex);
+    iree_hal_vulkan_queue_fail_pending_submissions(queue, status);
+    IREE_TRACE_ZONE_END(z0);
+    return 0;
+  }
   completed_head =
       iree_hal_vulkan_queue_pop_completed_submissions(queue, completed_epoch);
   iree_slim_mutex_unlock(&queue->submission_mutex);
