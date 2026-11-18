@@ -21,11 +21,17 @@ def ConvertConvToIm2ColPass :
     Rewrites every linalg op that implements a convolution, named or generic,
     as an all-parallel `linalg.generic` that gathers the convolved input
     windows, followed by a contraction over the gathered tensor with the
-    original payload. Contraction loops are collapsed wherever the operand
+    original payload. The match is on the input access, a sum of scaled loops
+    that is not a projected permutation, so it also covers what unit dimension
+    folding leaves of a convolution whose filter window has extent one along a
+    strided axis, which is no longer a convolution. Contraction loops are collapsed wherever the operand
     layouts allow, so standard layouts become plain or batched matmuls.
     Convolutions without an output channel dimension, i.e. depthwise
     convolutions with a unit multiplier and pooling ops, are left unchanged:
-    nothing reuses the gathered input, so the rewrite never pays off.
+    nothing reuses the gathered input, so the rewrite never pays off. The
+    exception is a convolution whose gather is identical to that of another
+    rewritten convolution, such as the input window sum of a quantized
+    convolution with a weight zero point; it reads the shared gather.
 
     The pass expects quantization to be lowered already: quantized
     convolutions such as `linalg.conv_2d_nhwc_hwcf_q` are not matched, and
@@ -147,7 +153,8 @@ def ExpandTensorShapesPass :
 
 def FoldBroadcastIntoBatchMatmulPass :
     InterfacePass<"iree-global-opt-fold-broadcast-into-batch-matmul", "mlir::FunctionOpInterface"> {
-  let summary = "Folds broadcasts of batch_matmul inputs into its indexing maps.";
+  let summary =
+      "Folds broadcasts of contraction inputs into its indexing maps.";
   let description = [{
     Rewrites `batch_matmul(A, broadcast(B))`, where the weight is shared across
     the batch, into a `batch_matmul` over `A` and `B` whose RHS indexing map
@@ -159,9 +166,21 @@ def FoldBroadcastIntoBatchMatmulPass :
     same body instead of moving data. The contraction then consumes its
     producers directly, so rewrites that match on them (such as the
     dequantization folding) still apply, and no broadcast is materialized.
+
+    A broadcast under an `iree_linalg_ext.dequantize_affine` that only feeds
+    the contraction folds too, when the scale and zero point do not vary along
+    the broadcast dims: the dequantize is rebuilt at the rank of the
+    broadcast's source and the broadcast is folded into the contraction map in
+    the same step, so the weights are dequantized once rather than once per
+    batch element.
+
+    A contraction that is already a `linalg.generic`, such as a `batch_matmul`
+    generalized earlier in the pipeline, is recognized through the contraction
+    interface and folded the same way; it stays a generic.
   }];
   let dependentDialects = [
     "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
   ];
 }
 
@@ -327,6 +346,41 @@ def RemoveZeroExtentTensorsPass :
 
 def SimplifyPackUnpackPass : Pass<"iree-global-opt-simplify-pack-unpack", ""> {
   let summary = "Simplifies tensor pack and unpack ops.";
+}
+
+def SplitLargeConstantsPass :
+    Pass<"iree-global-opt-split-large-constants", "mlir::ModuleOp"> {
+  let summary = "Splits constants larger than the max allocation size into shards.";
+  let description = [{
+    A constant global whose storage exceeds the max allocation size of its
+    resource config (`--iree-stream-resource-max-allocation-size` unless the
+    target sets one) cannot be packed into a resource within that limit. This
+    pass splits such a private, immutable global with an inline dense value or
+    a named parameter into shards along its outermost non-unit dimension, so
+    each shard is a contiguous byte range of the original that fits into one
+    allocation. A shard of a named parameter refers to its range of the same
+    parameter through the `offset` and `length` config entries. The pass then
+    rewrites the uses of the global's loads to use the shards:
+
+      * an input of a structured op whose split dimension is indexed by a
+        single loop: the op is split along that loop, one op per shard. The
+        results of a parallel loop are inserted into the destination, the ops
+        of a reduction loop accumulate into the result of the previous one.
+        This covers e.g. matmuls with a large weight such as a tied LM head.
+      * a value read with `tensor.extract` in the body of an elementwise
+        `linalg.generic`, e.g. an embedding lookup: one op per shard reads its
+        shard at the rebased, clamped index and keeps the previous op's
+        element unless the index lies in its shard.
+
+    A constant with any other use is left unchanged with a warning.
+  }];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
+    "IREE::Stream::StreamDialect",
+    "IREE::Util::UtilDialect",
+  ];
 }
 
 def GlobalLoopInvariantCodeMotionPass : InterfacePass<"iree-global-opt-loop-invariant-code-motion", "mlir::FunctionOpInterface"> {

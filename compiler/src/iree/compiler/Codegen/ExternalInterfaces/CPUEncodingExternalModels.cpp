@@ -437,6 +437,9 @@ getMmaIntrinsicRequiredFeatures(IREE::CPU::MMAIntrinsic intr) {
   case MMAIntrinsic::MMA_RISCV_V_VFMACC_1x8VLsx1_F16_F16_WIDENF32:
   case MMAIntrinsic::MMA_RISCV_V_VFMACC_8VLsx1x1_F16_F16_WIDENF32:
     return {"+v", "+zvfhmin"};
+  case MMAIntrinsic::MMA_RISCV_V_VFWMACCBF16_1x8VLsx1_F32_BF16:
+  case MMAIntrinsic::MMA_RISCV_V_VFWMACCBF16_8VLsx1x1_F32_BF16:
+    return {"+v", "+zvfbfwma"};
   default:
     return {};
   }
@@ -634,6 +637,8 @@ getMmaIntrinsicsForTargetConfig(DictionaryAttr config) {
         MMAIntrinsic::MMA_RISCV_V_VFMACC_8VLsx1x1_F32_F16_CASTF32,
         MMAIntrinsic::MMA_RISCV_V_VFMACC_1x8VLsx1_F16_F16_WIDENF32,
         MMAIntrinsic::MMA_RISCV_V_VFMACC_8VLsx1x1_F16_F16_WIDENF32,
+        MMAIntrinsic::MMA_RISCV_V_VFWMACCBF16_1x8VLsx1_F32_BF16,
+        MMAIntrinsic::MMA_RISCV_V_VFWMACCBF16_8VLsx1x1_F32_BF16,
     };
     checkIntrinsicRequiredFeatures(config, kAllRiscvV, out);
   }
@@ -1558,11 +1563,35 @@ static SmallVector<TileMxNxK> enumerateMatmulTileX86_64(TypeRange elementTypes,
   return {};
 }
 
+// Enumerate tile sizes to choose from on Wasm.
+// For narrow-{M,N} cases, this only enumerates on narrow M. The narrow-N cases
+// are handled by transposition in chooseMatmulTile.
+static SmallVector<TileMxNxK> enumerateMatmulTileWasm(TypeRange elementTypes,
+                                                      DictionaryAttr config) {
+  if (hasFeature(config, "+simd128") &&
+      llvm::all_of(elementTypes, [](Type type) { return type.isF32(); })) {
+    // SIMD128 has four FP32 lanes: N0=8 exposes two SIMD chunks per row,
+    // and M0=4 exposes four rows for RHS reuse and LHS scalar broadcasts.
+    // The 4x8 tile needs eight v128 accumulator values, leaving headroom for
+    // RHS vectors, broadcasts and mul/add temporaries. This is a live-value
+    // budget: the Wasm engine allocates physical registers for the host.
+    // K0=1 requests no extra inner-K unrolling through the packed layout.
+    // The narrow-M tiles reduce accumulator values to four/two and avoid
+    // padding one/two-row matmuls to four rows.
+    return {TileMxNxK{4, 8, 1}, TileMxNxK{2, 8, 1}, TileMxNxK{1, 8, 1}};
+  }
+  // Fallback - no architecture-optimized tile size for this case.
+  return {};
+}
+
 static SmallVector<TileMxNxK>
 enumerateCPUMatmulTiles(IREE::Encoding::EncodingAttr encoding,
                         DictionaryAttr config) {
   // Enumerate available tile shapes for the given encoding and config.
   SmallVector<Type> elementTypes = encoding.getElementTypesArray();
+  if (isWasm(config)) {
+    return enumerateMatmulTileWasm(elementTypes, config);
+  }
   if (isAArch64(config)) {
     return enumerateMatmulTileArm64(elementTypes, config);
   }
